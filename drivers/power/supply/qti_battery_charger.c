@@ -77,7 +77,6 @@ ATOMIC_NOTIFIER_HEAD(pen_charge_state_notifier);
  * Bypass engage is smart_chg=(scene-1) then 3, revert is (scene-2) then 2.
  * Writes need a settling gap, so they run one per delayed-work tick.
  */
-#define BYPASS_TARGET_SCENE		SMART_CHG_SCENE_TGAME
 #define BYPASS_MAX_STEPS		6
 #define BYPASS_STEP_DELAY_MS		1000
 
@@ -916,6 +915,8 @@ struct battery_chg_dev {
 	struct mutex			bypass_lock;
 	int				bypass_target;	/* -1 idle, else 0/1 in flight */
 	int				bypass_applied;	/* last confirmed state */
+	int				bypass_mode_sel;	/* index into bypass_modes[] */
+	u32				bypass_scene;	/* scene latched at engage */
 	u32				bypass_saved_smart_chg;
 	u32				bypass_saved_sport_mode;
 	bool				bypass_saved_valid;
@@ -4043,16 +4044,16 @@ static ssize_t fastcharge_enable_show(struct class *c,
 static CLASS_ATTR_RW(fastcharge_enable);
 
 /*
- * Undo bypass, then restore the raw fastcharge pair saved at engage time.
- * The show/store mode mappings aren't inverses, so a mode ID won't do.
- * Caller holds bypass_lock.
+ * Undo the latched bypass scene, then restore the raw fastcharge pair
+ * saved at engage time. The show/store mode mappings aren't inverses,
+ * so a mode ID won't do. Caller holds bypass_lock.
  */
 static void bypass_build_revert(struct battery_chg_dev *bcdev)
 {
 	int n = 0;
 
 	bcdev->bypass_steps[n++] = (struct bypass_step){
-		XM_PROP_SMART_CHG, BYPASS_TARGET_SCENE - 2 };
+		XM_PROP_SMART_CHG, bcdev->bypass_scene - 2 };
 	bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG, 2 };
 	if (bcdev->bypass_saved_valid) {
 		bcdev->bypass_steps[n++] = (struct bypass_step){
@@ -4108,12 +4109,11 @@ static void bypass_charging_work_fn(struct work_struct *work)
 	/* A successful write doesn't mean the firmware applied the scene */
 	if (target == 1) {
 		rc = read_property_id(bcdev, pst, XM_PROP_SMART_CHG);
-		if (!rc && pst->prop[XM_PROP_SMART_CHG] !=
-					BYPASS_TARGET_SCENE) {
+		if (!rc && pst->prop[XM_PROP_SMART_CHG] != bcdev->bypass_scene) {
 			dev_err(bcdev->dev,
-				"bypass_charging: engage not effective (scene %u != %d), rolling back\n",
+				"bypass_charging: engage not effective (scene %u != %u), rolling back\n",
 				pst->prop[XM_PROP_SMART_CHG],
-				BYPASS_TARGET_SCENE);
+				bcdev->bypass_scene);
 			goto fail;
 		}
 	}
@@ -4146,6 +4146,16 @@ fail:
 	dev_err(bcdev->dev, "bypass_charging: sequence aborted, state cleared\n");
 }
 
+static const struct bypass_mode {
+	const char *name;
+	u32 scene;
+} bypass_modes[] = {
+	{ "tgame",	SMART_CHG_SCENE_TGAME },
+	{ "navigation",	SMART_CHG_SCENE_NAVIGATION },
+	{ "nolimit",	SMART_CHG_SCENE_NOLIMIT },
+};
+#define BYPASS_NUM_MODES	((int)ARRAY_SIZE(bypass_modes))
+
 static ssize_t bypass_charging_enable_store(struct class *c,
 				struct class_attribute *attr,
 				const char *buf, size_t count)
@@ -4153,7 +4163,7 @@ static ssize_t bypass_charging_enable_store(struct class *c,
 	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
 						battery_class);
 	struct psy_state *pst = &bcdev->psy_list[PSY_TYPE_XM];
-	u32 smart, sport;
+	u32 smart, sport, scene;
 	int val, n, rc;
 
 	if (kstrtoint(buf, 0, &val))
@@ -4185,6 +4195,9 @@ static ssize_t bypass_charging_enable_store(struct class *c,
 	}
 
 	if (val) {
+		/* Latch the scene so verify and revert use what was engaged */
+		scene = bypass_modes[bcdev->bypass_mode_sel].scene;
+		bcdev->bypass_scene = scene;
 		bcdev->bypass_saved_smart_chg = smart;
 		bcdev->bypass_saved_sport_mode = sport;
 		bcdev->bypass_saved_valid = true;
@@ -4195,7 +4208,7 @@ static ssize_t bypass_charging_enable_store(struct class *c,
 			return n;
 		}
 		bcdev->bypass_steps[n++] = (struct bypass_step){
-			XM_PROP_SMART_CHG, BYPASS_TARGET_SCENE - 1 };
+			XM_PROP_SMART_CHG, scene - 1 };
 		bcdev->bypass_steps[n++] = (struct bypass_step){ XM_PROP_SMART_CHG, 3 };
 		bcdev->bypass_step_count = n;
 		bcdev->bypass_step_idx = 0;
@@ -4227,6 +4240,54 @@ static ssize_t bypass_charging_enable_show(struct class *c,
 			  in_flight ? "-pending" : "");
 }
 static CLASS_ATTR_RW(bypass_charging_enable);
+
+static ssize_t bypass_charging_mode_store(struct class *c,
+				struct class_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+						battery_class);
+	int i, idx = -1;
+	u32 num;
+
+	for (i = 0; i < BYPASS_NUM_MODES; i++) {
+		if (sysfs_streq(buf, bypass_modes[i].name)) {
+			idx = i;
+			break;
+		}
+	}
+	if (idx < 0) {
+		if (kstrtou32(buf, 0, &num) || num >= BYPASS_NUM_MODES)
+			return -EINVAL;
+		idx = num;
+	}
+
+	mutex_lock(&bcdev->bypass_lock);
+	bcdev->bypass_mode_sel = idx;
+	mutex_unlock(&bcdev->bypass_lock);
+
+	return count;
+}
+
+static ssize_t bypass_charging_mode_show(struct class *c,
+				struct class_attribute *attr, char *buf)
+{
+	struct battery_chg_dev *bcdev = container_of(c, struct battery_chg_dev,
+						battery_class);
+	int i, sel, len = 0;
+
+	mutex_lock(&bcdev->bypass_lock);
+	sel = bcdev->bypass_mode_sel;
+	mutex_unlock(&bcdev->bypass_lock);
+
+	for (i = 0; i < BYPASS_NUM_MODES; i++)
+		len += scnprintf(buf + len, PAGE_SIZE - len, "%s%s%s%s",
+				 i ? " " : "", i == sel ? "[" : "",
+				 bypass_modes[i].name, i == sel ? "]" : "");
+
+	return len + scnprintf(buf + len, PAGE_SIZE - len, "\n");
+}
+static CLASS_ATTR_RW(bypass_charging_mode);
 
 QTI_CHARGER_RO_SHOW(usb_typec_compliant, PSY_TYPE_USB, USB_TYPEC_COMPLIANT);
 
@@ -10377,6 +10438,7 @@ static struct attribute *battery_class_attrs[] = {
 	&class_attr_cc_toggle.attr,
 	&class_attr_smart_chg.attr,
 	&class_attr_bypass_charging_enable.attr,
+	&class_attr_bypass_charging_mode.attr,
 	&class_attr_low_fast_para.attr,
 	&class_attr_lowfast_sw_para.attr,
 	&class_attr_smart_sic_mode.attr,
@@ -11413,6 +11475,8 @@ static int battery_chg_probe(struct platform_device *pdev)
 	mutex_init(&bcdev->bypass_lock);
 	bcdev->bypass_target = -1;
 	bcdev->bypass_applied = 0;
+	bcdev->bypass_mode_sel = 0;
+	bcdev->bypass_scene = bypass_modes[0].scene;
 	INIT_DELAYED_WORK(&bcdev->bypass_charging_work, bypass_charging_work_fn);
 #if defined(CONFIG_OF) && defined(CONFIG_DRM_PANEL)
 	INIT_DELAYED_WORK(&bcdev->panel_notify_register_work, battery_register_panel_notifier_work);
