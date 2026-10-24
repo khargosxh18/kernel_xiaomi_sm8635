@@ -7407,15 +7407,6 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu, int sy
 		cpu_thermal_cap = arch_scale_cpu_capacity(cpu);
 		cpu_thermal_cap -= arch_scale_thermal_pressure(cpu);
 
-                /*
-		 * QUALCOMM WALT: Prime Core Isolation
-		 * Skip the Cortex-X4 (Prime) domain if task utilization is below
-		 * 20% (~205 on 1024 scale). This safely blocks lightweight 5%
-		 * background threads while allowing the ~50% render threads.
-		 */
-		if (arch_scale_cpu_capacity(cpu) >= 1000 && task_util_est(p) < 205)
-			continue;
-
 		eenv.cpu_cap = cpu_thermal_cap;
 		eenv.pd_cap = 0;
 
