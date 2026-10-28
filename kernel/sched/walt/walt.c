@@ -3073,7 +3073,13 @@ static void _set_preferred_cluster(struct walt_related_thread_group *grp)
 
 	list_for_each_entry(wts, &grp->tasks, grp_list) {
 		p = wts_to_ts(wts);
-		if (task_boost_policy(p) == SCHED_BOOST_ON_BIG) {
+		/*
+		 * Storage boost is raised by the UFS driver during I/O and must
+		 * not pin the top-app group on the min cluster / block skip_min,
+		 * otherwise heavy-task pipelining never runs while assets stream.
+		 */
+		if (!is_storage_boost() &&
+		    task_boost_policy(p) == SCHED_BOOST_ON_BIG) {
 			group_boost = true;
 			break;
 		}
