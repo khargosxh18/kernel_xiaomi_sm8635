@@ -1163,7 +1163,7 @@ static void waltgov_exit(struct cpufreq_policy *policy)
  * different SoC or cluster by accident.
  */
 static const unsigned int waltgov_bad_freqs_gold[] = {
-	940800, 1056000, 1190400,
+	940800, 1056000, 1190400, 1824000, 1920000, 2073600,
 };
 
 static const unsigned int waltgov_bad_freqs_prime[] = {
